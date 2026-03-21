@@ -404,13 +404,26 @@ def install_cls_loss_into_detector(
             targets=None,
         ):
             if self.training:
-                # Step 1: run parent forward (gets all 5 losses)
-                loss_dict = super().forward(
+                # ── Training: call parent, then extract the loss dict
+                # regardless of whether parent returns a dict or a
+                # (detections, loss_dict) tuple (nightly torchvision
+                # changed the return signature).
+                parent_result = super().forward(
                     features, proposals, image_shapes, targets
                 )
+                if isinstance(parent_result, dict):
+                    loss_dict = parent_result
+                elif isinstance(parent_result, (tuple, list)):
+                    # nightly: returns (detections, loss_dict)
+                    # find the dict element
+                    loss_dict = next(
+                        x for x in parent_result if isinstance(x, dict)
+                    )
+                else:
+                    loss_dict = parent_result
 
-                # Step 2: re-run box head to get raw class_logits
-                # select_training_samples is stable across all versions
+                # Re-run box head to get raw class_logits so we can
+                # apply our Focal/CE loss instead of the internal CE.
                 proposals_matched, _, labels, _ = \
                     self.select_training_samples(proposals, targets)
 
@@ -423,7 +436,7 @@ def install_cls_loss_into_detector(
                 # Flatten per-image label lists to single tensor [N]
                 all_labels = torch.cat(labels, dim=0)
 
-                # Step 3: overwrite loss_classifier with our loss
+                # Overwrite loss_classifier with our Focal/CE loss
                 loss_dict["loss_classifier"] = self._cls_loss_fn(
                     class_logits, all_labels
                 )
@@ -431,7 +444,7 @@ def install_cls_loss_into_detector(
                 return loss_dict
 
             else:
-                # Inference path — completely unchanged
+                # Inference — unchanged, return whatever parent returns
                 return super().forward(
                     features, proposals, image_shapes, targets
                 )
