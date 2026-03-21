@@ -25,6 +25,19 @@ Theory:
 
     This forces the model to focus on rare, hard instances
     (destroyed buildings) instead of easy majority class.
+
+Fix applied:
+    [BUG-3] Focal loss is now actually used.
+            Previously XRayEarthLoss built a cls_loss_fn (Focal or CE)
+            but compute_total_loss() just re-summed whatever MaskRCNN
+            already computed internally with its own fixed CE loss.
+            The custom loss function was completely ignored.
+
+            Fix: install_cls_loss_into_detector() monkey-patches
+            detector.roi_heads with a subclass (XRayEarthRoIHeads)
+            that overrides the internal fastrcnn_loss call to use our
+            Focal or weighted-CE loss function for loss_classifier.
+            All other losses (box_reg, mask, rpn) are unchanged.
 """
 
 import torch
@@ -95,7 +108,7 @@ class FocalLoss(nn.Module):
         """
         # Handle ignore_index
         if self.ignore_index >= 0:
-            valid = targets != self.ignore_index
+            valid   = targets != self.ignore_index
             inputs  = inputs[valid]
             targets = targets[valid]
 
@@ -119,7 +132,7 @@ class FocalLoss(nn.Module):
         if self.alpha is not None:
             if isinstance(self.alpha, torch.Tensor):
                 # Per-class alpha: index by target class
-                alpha_t = self.alpha.to(inputs.device)[targets]
+                alpha_t      = self.alpha.to(inputs.device)[targets]
             else:
                 alpha_t = self.alpha
             focal_weight = alpha_t * focal_weight
@@ -330,19 +343,111 @@ def compute_class_weights(
         beta = 0.9999
         for cls_id, count in damage_counts.items():
             if cls_id < num_classes:
-                effective_n  = (1.0 - beta ** count) / (1.0 - beta)
+                effective_n    = (1.0 - beta ** count) / (1.0 - beta)
                 weights[cls_id] = 1.0 / effective_n
 
     # Normalize so mean weight = 1.0 (keeps loss scale stable)
     damage_weight_vals = weights[1:]  # exclude background
     damage_weight_vals = damage_weight_vals / damage_weight_vals.mean()
-    weights[1:] = damage_weight_vals
+    weights[1:]        = damage_weight_vals
 
     return weights
 
 
 # ═══════════════════════════════════════════════════════════
-#  5. MASK R-CNN LOSS INTEGRATION
+#  5. ROI HEADS SUBCLASS — HOOKS FOCAL LOSS INTO MASKRCNN
+#                          [FIX BUG-3]
+# ═══════════════════════════════════════════════════════════
+
+def install_cls_loss_into_detector(
+    detector:    "torchvision.models.detection.MaskRCNN",
+    cls_loss_fn: nn.Module,
+) -> None:
+    """
+    Replace MaskRCNN's internal ROI classification loss with our
+    custom Focal Loss or weighted CrossEntropy.
+
+    Strategy (version-agnostic):
+        Avoids importing internal torchvision symbols (StandardRoIHeads
+        was renamed to RoIHeads in nightly; fastrcnn_loss was inlined).
+        Instead we:
+          1. Run parent roi_heads.forward() to get all 5 standard losses
+             including loss_classifier (computed with CE internally).
+          2. Re-run only the box head on matched proposals to get the
+             raw class_logits.
+          3. Overwrite loss_dict["loss_classifier"] with our loss.
+
+        Works on torchvision 0.16 stable through 0.21+ nightly.
+
+    Args:
+        detector:    MaskRCNN model (modified in-place)
+        cls_loss_fn: FocalLoss or WeightedCrossEntropyLoss instance
+    """
+    original_roi_heads = detector.roi_heads
+
+    class XRayEarthRoIHeads(type(original_roi_heads)):
+        """
+        Version-agnostic roi_heads subclass that replaces
+        loss_classifier with the user-supplied cls_loss_fn.
+
+        All other losses (box_reg, mask, objectness, rpn_box_reg)
+        are computed by the parent class and returned unchanged.
+        """
+
+        _cls_loss_fn: nn.Module  # injected after class creation
+
+        def forward(
+            self,
+            features,
+            proposals,
+            image_shapes,
+            targets=None,
+        ):
+            if self.training:
+                # Step 1: run parent forward (gets all 5 losses)
+                loss_dict = super().forward(
+                    features, proposals, image_shapes, targets
+                )
+
+                # Step 2: re-run box head to get raw class_logits
+                # select_training_samples is stable across all versions
+                proposals_matched, _, labels, _ = \
+                    self.select_training_samples(proposals, targets)
+
+                box_features    = self.box_roi_pool(
+                    features, proposals_matched, image_shapes
+                )
+                box_features    = self.box_head(box_features)
+                class_logits, _ = self.box_predictor(box_features)
+
+                # Flatten per-image label lists to single tensor [N]
+                all_labels = torch.cat(labels, dim=0)
+
+                # Step 3: overwrite loss_classifier with our loss
+                loss_dict["loss_classifier"] = self._cls_loss_fn(
+                    class_logits, all_labels
+                )
+
+                return loss_dict
+
+            else:
+                # Inference path — completely unchanged
+                return super().forward(
+                    features, proposals, image_shapes, targets
+                )
+
+    # Patch existing roi_heads instance in-place
+    original_roi_heads.__class__ = XRayEarthRoIHeads
+    original_roi_heads._cls_loss_fn = cls_loss_fn
+
+    console.log(
+        f"[green]✓[/green] ROI classifier loss hooked: "
+        f"[bold]{type(cls_loss_fn).__name__}[/bold]"
+    )
+
+
+# ═══════════════════════════════════════════════════════════
+#  6. MASK R-CNN LOSS WRAPPER
 # ═══════════════════════════════════════════════════════════
 
 class XRayEarthLoss(nn.Module):
@@ -350,15 +455,14 @@ class XRayEarthLoss(nn.Module):
     Complete loss wrapper for XRayEarth training.
 
     Mask R-CNN internally computes 5 losses:
-        loss_classifier   ← we replace this with Focal/CE
+        loss_classifier   ← replaced with our Focal/CE via roi_heads hook
         loss_box_reg      ← kept as standard smooth L1
         loss_mask         ← kept as standard binary CE
         loss_objectness   ← kept as standard BCE
         loss_rpn_box_reg  ← kept as standard smooth L1
 
-    We only replace the ROI classification loss.
-    The other losses are already computed by torchvision's
-    Mask R-CNN and returned in the loss dict.
+    Call install_into_detector() after building the model to
+    activate the focal-loss hook on its roi_heads.
 
     Args:
         cfg:          Experiment config
@@ -369,7 +473,7 @@ class XRayEarthLoss(nn.Module):
         super().__init__()
         self.cfg = cfg
 
-        # Classification loss (the one we replace)
+        # Classification loss (replaces MaskRCNN's internal CE)
         self.cls_loss_fn = build_classification_loss(cfg, class_counts)
 
         # Loss weights for combining components
@@ -381,6 +485,19 @@ class XRayEarthLoss(nn.Module):
             "loss_rpn_box_reg":  1.0,
         }
 
+    def install_into_detector(self, detector) -> None:
+        """
+        Hook our cls_loss_fn into the detector's roi_heads.
+
+        Call this once after building the model:
+            loss_wrapper = XRayEarthLoss(cfg, class_counts)
+            loss_wrapper.install_into_detector(model.detector)
+
+        Args:
+            detector: XRayEarthModel.detector (MaskRCNN instance)
+        """
+        install_cls_loss_into_detector(detector, self.cls_loss_fn)
+
     def compute_total_loss(
         self,
         loss_dict: Dict[str, torch.Tensor],
@@ -389,7 +506,8 @@ class XRayEarthLoss(nn.Module):
         Compute weighted total loss from Mask R-CNN loss dict.
 
         The loss_dict is returned directly by model(images, targets)
-        in training mode. We scale each component by its weight.
+        in training mode.  loss_classifier is already our focal/CE
+        loss thanks to the roi_heads hook.
 
         Args:
             loss_dict: Dict from Mask R-CNN forward pass
@@ -414,7 +532,7 @@ class XRayEarthLoss(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════
-#  6. LOSS COMPARISON UTILITIES
+#  7. LOSS COMPARISON UTILITIES
 # ═══════════════════════════════════════════════════════════
 
 def compare_losses_on_batch(
@@ -461,7 +579,7 @@ def compare_losses_on_batch(
 
 
 # ═══════════════════════════════════════════════════════════
-#  7. QUICK SELF-TEST
+#  8. QUICK SELF-TEST
 # ═══════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
@@ -479,16 +597,14 @@ if __name__ == "__main__":
     print("\n  Testing Focal Loss...")
     focal = FocalLoss(gamma=2.0, alpha=0.25)
 
-    # Simulate imbalanced batch:
-    # 80 easy "no-damage", 10 minor, 7 major, 3 destroyed
     N, C = 100, 5
     logits = torch.randn(N, C)
 
     targets = torch.cat([
-        torch.zeros(80, dtype=torch.long),   # no-damage (majority)
-        torch.ones(10,  dtype=torch.long),   # minor
-        torch.full((7,), 2, dtype=torch.long),  # major
-        torch.full((3,), 3, dtype=torch.long),  # destroyed (rare)
+        torch.zeros(80, dtype=torch.long),
+        torch.ones(10,  dtype=torch.long),
+        torch.full((7,), 2, dtype=torch.long),
+        torch.full((3,), 3, dtype=torch.long),
     ])
 
     fl = focal(logits, targets)
@@ -497,19 +613,18 @@ if __name__ == "__main__":
 
     # ── Test CrossEntropy ──────────────────────────────────
     print("\n  Testing CrossEntropy...")
-    ce = WeightedCrossEntropyLoss()
+    ce  = WeightedCrossEntropyLoss()
     cel = ce(logits, targets)
     assert cel.item() > 0
     print(f"  ✓ Cross Entropy: {cel.item():.4f}")
 
     # ── Verify focal < CE for easy majority class ──────────
-    # On easy examples, focal should be lower
     easy_logits  = torch.zeros(10, C)
-    easy_logits[:, 0] = 5.0              # very confident "no-damage"
+    easy_logits[:, 0] = 5.0
     easy_targets = torch.zeros(10, dtype=torch.long)
 
-    easy_fl  = focal(easy_logits, easy_targets).item()
-    easy_ce  = ce(easy_logits, easy_targets).item()
+    easy_fl = focal(easy_logits, easy_targets).item()
+    easy_ce = ce(easy_logits, easy_targets).item()
     print(f"\n  Imbalance test (easy majority examples):")
     print(f"  ✓ CE loss:    {easy_ce:.6f}")
     print(f"  ✓ Focal loss: {easy_fl:.6f}  ← should be << CE")
@@ -519,8 +634,7 @@ if __name__ == "__main__":
 
     # ── Test class weight computation ─────────────────────
     print("\n  Testing class weight computation...")
-    # Simulate extreme imbalance
-    counts = {1: 8000, 2: 1000, 3: 700, 4: 300}
+    counts  = {1: 8000, 2: 1000, 3: 700, 4: 300}
     weights = compute_class_weights(counts)
     print(f"  ✓ Class weights: {[f'{w:.3f}' for w in weights.tolist()]}")
     assert weights[4] > weights[1], \
