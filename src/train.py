@@ -22,12 +22,25 @@ import os
 import sys
 import time
 import argparse
+import warnings
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
+# Fix Windows cp1252 encoding — allow Unicode arrows/symbols in logs
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if sys.stderr.encoding != 'utf-8':
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
+# Suppress OneCycleLR false-positive warning on first batch
+warnings.filterwarnings(
+    "ignore",
+    message="Detected call of `lr_scheduler.step\\(\\)` before `optimizer.step\\(\\)`",
+)
+
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+# torch.amp.GradScaler used directly (torch.cuda.amp.GradScaler deprecated)
 from torch.utils.data import DataLoader
 import wandb
 from tqdm import tqdm
@@ -164,13 +177,14 @@ def build_scheduler(
     """
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr         = cfg.training.learning_rate,
-        epochs         = cfg.training.epochs,
-        steps_per_epoch= steps_per_epoch,
-        pct_start      = 0.1,    # 10% warmup
-        anneal_strategy= "cos",
-        div_factor     = 25,     # start_lr = max_lr / 25
-        final_div_factor=1e4,    # end_lr = start_lr / 10000
+        max_lr          = cfg.training.learning_rate,
+        epochs          = cfg.training.epochs,
+        steps_per_epoch = steps_per_epoch,
+        pct_start       = 0.1,    # 10% warmup
+        anneal_strategy = "cos",
+        div_factor      = 25,     # start_lr = max_lr / 25
+        final_div_factor= 1e4,    # end_lr = start_lr / 10000
+        last_epoch      = -1,     # fixes step-order warning
     )
 
     console.log(
@@ -191,10 +205,11 @@ def train_one_step(
     post_imgs: list,
     targets:   list,
     optimizer: torch.optim.Optimizer,
-    scaler:    GradScaler,
+    scaler:    torch.amp.GradScaler,
     loss_wrapper: "XRayEarthLoss",
     device:    torch.device,
     cfg,
+    scheduler = None,
 ) -> Dict[str, float]:
     """
     Single training step with AMP.
@@ -205,7 +220,7 @@ def train_one_step(
         post_imgs:    List of post-disaster tensors
         targets:      List of target dicts
         optimizer:    AdamW optimizer
-        scaler:       GradScaler for FP16
+        scaler:       torch.amp.GradScaler for FP16
         loss_wrapper: XRayEarthLoss
         device:       CUDA/CPU device
         cfg:          Experiment config
@@ -224,11 +239,23 @@ def train_one_step(
     optimizer.zero_grad()
 
     # ── Mixed Precision Forward Pass ──────────────────────
-    with autocast():
+    with torch.amp.autocast("cuda"):
         loss_dict = model(pre_imgs, post_imgs, targets)
 
     # ── Compute total weighted loss ───────────────────────
     total_loss, scalar_losses = loss_wrapper.compute_total_loss(loss_dict)
+
+    # ── NaN guard — skip step if loss is NaN/Inf ─────────
+    # NaN loss means gradients are NaN; applying them
+    # permanently corrupts all weights. Skip and continue.
+    # Do NOT call scaler.update() here — it requires a prior
+    # scaler.scale().backward() call or raises AssertionError.
+    if not torch.isfinite(total_loss):
+        scalar_losses["loss_total"] = float("nan")
+        optimizer.zero_grad()  # clear any partial gradients
+        if scheduler is not None:
+            scheduler.step()
+        return scalar_losses
 
     # ── Scaled Backward Pass ──────────────────────────────
     scaler.scale(total_loss).backward()
@@ -244,6 +271,10 @@ def train_one_step(
     scaler.step(optimizer)
     scaler.update()
 
+    # ── Scheduler Step (after optimizer — correct order) ──
+    if scheduler is not None:
+        scheduler.step()
+
     return scalar_losses
 
 
@@ -256,7 +287,7 @@ def train_one_epoch(
     dataloader:   DataLoader,
     optimizer:    torch.optim.Optimizer,
     scheduler,
-    scaler:       GradScaler,
+    scaler:       torch.amp.GradScaler,
     loss_wrapper: "XRayEarthLoss",
     device:       torch.device,
     cfg,
@@ -308,10 +339,8 @@ def train_one_epoch(
         step_losses = train_one_step(
             model, pre_imgs, post_imgs, targets,
             optimizer, scaler, loss_wrapper, device, cfg,
+            scheduler=scheduler,
         )
-
-        # Step scheduler
-        scheduler.step()
 
         # Accumulate losses
         for k, v in step_losses.items():
@@ -392,11 +421,14 @@ def train(args: argparse.Namespace) -> None:
 
     # ── Loss ──────────────────────────────────────────────
     loss_wrapper = XRayEarthLoss(cfg, class_counts)
+    # [FIX BUG-3] Install Focal/CE loss into detector's roi_heads so
+    # MaskRCNN's internal loss_classifier uses our loss function.
+    loss_wrapper.install_into_detector(model.detector)
 
     # ── Optimizer & Scheduler ─────────────────────────────
     optimizer = build_optimizer(model, cfg)
     scheduler = build_scheduler(optimizer, cfg, len(train_loader))
-    scaler    = GradScaler()  # AMP gradient scaler
+    scaler    = torch.amp.GradScaler("cuda")  # AMP gradient scaler
 
     # ── Resume from Checkpoint ────────────────────────────
     start_epoch  = 0

@@ -3,7 +3,7 @@ defaults:
 
 project:
   version: v6
-  description: "V5 → Unfreeze backbone (full model fine-tuned + optimized HP)"
+  description: "V5 -> Unfreeze backbone (full model fine-tuned + optimized HP)"
 
 model:
   pretrained: true
