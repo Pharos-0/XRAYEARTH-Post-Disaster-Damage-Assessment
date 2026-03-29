@@ -543,21 +543,23 @@ def evaluate(
     # Mode 2 metrics (binary change detection)
     if cfg.evaluation.mode2 and len(all_gt_labels_m2) > 0:
         # Binary F1 for change detection
+        # [FIX BUG-10] Removed dead "valid = gt_m2 >= 0" mask.
+        # Mode-2 labels are remapped to 0/1 so all values are always
+        # non-negative — the mask was a no-op and added confusion.
         pred_m2 = np.array(all_pred_labels_m2)
         gt_m2   = np.array(all_gt_labels_m2)
-        valid   = gt_m2 >= 0
 
         binary_f1 = f1_score(
-            gt_m2[valid], pred_m2[valid],
+            gt_m2, pred_m2,
             average       = "binary",
             zero_division = 0,
         )
         binary_prec = precision_score(
-            gt_m2[valid], pred_m2[valid],
+            gt_m2, pred_m2,
             zero_division = 0,
         )
         binary_rec = recall_score(
-            gt_m2[valid], pred_m2[valid],
+            gt_m2, pred_m2,
             zero_division = 0,
         )
 
@@ -565,19 +567,22 @@ def evaluate(
         metrics["m2_binary_precision"] = float(binary_prec)
         metrics["m2_binary_recall"]    = float(binary_rec)
 
-    # mAP
+    # mAP — computed per-image to avoid OOM from giant IoU matrices.
+    # Concatenating all boxes across the full val set creates an
+    # N_pred x N_gt matrix that can be tens of GB for 4584 tiles.
     if len(all_pred_boxes) > 0:
-        cat_pred_boxes  = torch.cat(all_pred_boxes,  dim=0)
-        cat_pred_scores = torch.cat(all_pred_scores, dim=0)
-        cat_pred_lbls   = torch.cat(all_pred_lbls,   dim=0)
-        cat_gt_boxes    = torch.cat(all_gt_boxes,    dim=0)
-        cat_gt_lbls     = torch.cat(all_gt_lbls,     dim=0)
+        per_image_aps = []
+        for pred_b, pred_s, pred_l, gt_b, gt_l in zip(
+            all_pred_boxes, all_pred_scores,
+            all_pred_lbls,  all_gt_boxes, all_gt_lbls
+        ):
+            if len(pred_b) == 0 or len(gt_b) == 0:
+                continue
+            ap = compute_map(pred_b, pred_s, pred_l, gt_b, gt_l)
+            if ap > 0 or len(gt_b) > 0:
+                per_image_aps.append(ap)
 
-        map_score = compute_map(
-            cat_pred_boxes, cat_pred_scores, cat_pred_lbls,
-            cat_gt_boxes,   cat_gt_lbls,
-        )
-        metrics["mAP"] = map_score
+        metrics["mAP"] = float(np.mean(per_image_aps)) if per_image_aps else 0.0
 
     # Default fallback
     if "macro_f1" not in metrics:
