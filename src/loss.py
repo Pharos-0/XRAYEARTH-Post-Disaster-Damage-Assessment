@@ -439,15 +439,20 @@ def install_cls_loss_into_detector(
 
             def _capturing_subsample(labels):
                 result = original_subsample(labels)
-                # labels is a list of per-image label tensors
-                # after subsample the sampled indices let us
-                # collect the actual labels used in CE loss
                 sampled_pos, sampled_neg = result
                 all_sampled = []
                 for pos, neg, lbl in zip(sampled_pos, sampled_neg, labels):
-                    idx = torch.cat([pos, neg], dim=0)
-                    all_sampled.append(lbl[idx])
-                captured["labels"] = torch.cat(all_sampled, dim=0)
+                    # pos/neg may be 0-d scalars or empty — guard both
+                    parts = []
+                    if pos.dim() > 0 and pos.numel() > 0:
+                        parts.append(pos)
+                    if neg.dim() > 0 and neg.numel() > 0:
+                        parts.append(neg)
+                    if parts:
+                        idx = torch.cat(parts, dim=0)
+                        all_sampled.append(lbl[idx])
+                if all_sampled:
+                    captured["labels"] = torch.cat(all_sampled, dim=0)
                 return result
 
             self.box_predictor = _CapturingPredictor(original_predictor)
