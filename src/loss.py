@@ -410,71 +410,68 @@ def install_cls_loss_into_detector(
                 )
 
             # ── Training ──────────────────────────────────────────
-            # Strategy: intercept box_predictor output by temporarily
-            # replacing it with a wrapper that captures logits and
-            # labels DURING the parent forward pass — no second call
-            # to select_training_samples which caused CUDA errors.
+            # Strategy: capture BOTH logits AND sampled labels inside
+            # a single parent forward call using two lightweight hooks.
+            # This avoids any second CUDA kernel call entirely.
+            #
+            # Hook 1 — _CapturingPredictor: captures class_logits when
+            #   box_predictor(box_features) is called internally.
+            #
+            # Hook 2 — patched subsample: captures the sampled labels
+            #   list right after fg/bg sampling inside the parent.
+            #
+            # Both hooks are installed before super().forward() and
+            # restored in a finally block — guaranteed cleanup.
 
-            captured = {}
-            original_predictor = self.box_predictor
-            cls_loss_fn        = self._cls_loss_fn
+            captured            = {}
+            original_predictor  = self.box_predictor
+            original_subsample  = self.subsample
+            cls_loss_fn         = self._cls_loss_fn
 
             class _CapturingPredictor(torch.nn.Module):
-                """Wraps box_predictor to capture logits mid-forward."""
                 def __init__(self, wrapped):
                     super().__init__()
                     self.wrapped = wrapped
-
                 def forward(self, x):
                     scores, deltas = self.wrapped(x)
                     captured["logits"] = scores
                     return scores, deltas
 
+            def _capturing_subsample(labels):
+                result = original_subsample(labels)
+                # labels is a list of per-image label tensors
+                # after subsample the sampled indices let us
+                # collect the actual labels used in CE loss
+                sampled_pos, sampled_neg = result
+                all_sampled = []
+                for pos, neg, lbl in zip(sampled_pos, sampled_neg, labels):
+                    idx = torch.cat([pos, neg], dim=0)
+                    all_sampled.append(lbl[idx])
+                captured["labels"] = torch.cat(all_sampled, dim=0)
+                return result
+
             self.box_predictor = _CapturingPredictor(original_predictor)
+            self.subsample     = _capturing_subsample
 
             try:
                 parent_result = super().forward(
                     features, proposals, image_shapes, targets
                 )
             finally:
-                # Always restore original predictor
                 self.box_predictor = original_predictor
+                self.subsample     = original_subsample
 
-            # Unpack result — nightly returns (detections, loss_dict)
+            # Unpack — nightly torchvision returns (detections, loss_dict)
             if isinstance(parent_result, (tuple, list)):
                 detections, loss_dict = parent_result[0], parent_result[1]
             else:
                 detections = []
                 loss_dict  = parent_result
 
-            # Recompute loss_classifier using captured logits
-            # The parent already computed matched labels internally;
-            # we get them by re-matching from the loss_dict context.
-            # Since we have the logits, we recompute CE/Focal directly.
-            if "logits" in captured and "loss_classifier" in loss_dict:
-                # Get matched labels from parent's internal CE loss.
-                # We reverse-engineer labels by running the standard
-                # CE loss at the same logits and matching the value.
-                # Simplest correct approach: reuse parent's CE value
-                # as reference scale, then apply our weighted loss
-                # on top using the same logits with a pseudo-label
-                # derived from the argmax of softmax probabilities.
-                # For weighted CE and Focal: use logits directly with
-                # the labels implied by matching proposals to targets.
-
-                # Re-derive labels from proposals using assign_targets
-                # which is always safe to call (read-only, no CUDA ops):
-                matched_targets = self.assign_targets_to_proposals(
-                    proposals, [t["boxes"] for t in targets],
-                    [t["labels"] for t in targets]
-                )
-                all_labels = torch.cat(matched_targets, dim=0)
-
-                # Filter to only foreground + background (same as parent)
-                # Parent subsamples — we use all labels here which is
-                # slightly different but produces correct gradient signal.
+            # Replace loss_classifier with our Focal/CE loss
+            if "logits" in captured and "labels" in captured:
                 loss_dict["loss_classifier"] = cls_loss_fn(
-                    captured["logits"], all_labels
+                    captured["logits"], captured["labels"]
                 )
 
             return detections, loss_dict
