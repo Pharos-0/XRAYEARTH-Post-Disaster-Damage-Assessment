@@ -213,7 +213,7 @@ xrayearth/
 | Machine | GPU | Role |
 |---|---|---|
 | Machine A | RTX 3050 | Development + debugging |
-| Machine B | RTX 5060 (8GB) | Full training + TensorRT |
+| Machine B | RTX 5060 (8GB) | Full training + experimentation |
 
 ---
 
