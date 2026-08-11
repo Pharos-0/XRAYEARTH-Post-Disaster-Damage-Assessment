@@ -9,6 +9,12 @@ Responsibilities:
     - Hybrid caching: generate on-the-fly epoch 1, cache from epoch 2
     - Reconstruct full-image predictions from tile predictions
     - Handle both pre and post disaster image pairs together
+
+Fix applied:
+    [BUG-7] save_index() and load_index() type hints corrected.
+            The tile index stores 3-tuples (folder, image_id, tile_idx)
+            but both method signatures declared List[Tuple[str, int]]
+            (a 2-tuple).  Corrected to List[Tuple[str, str, int]].
 """
 
 import os
@@ -114,8 +120,6 @@ def generate_tile_coords(
             x2 = min(x + tile_size, image_w)
             y2 = min(y + tile_size, image_h)
 
-            # Snap small edge tiles back to full tile_size
-            # (pad later in extract_tile if needed)
             coords.append((x1, y1, x2, y2))
 
             if x2 == image_w:
@@ -157,7 +161,7 @@ def extract_tile(
     h, w = tile.shape[:2]
     if h < tile_size or w < tile_size:
         # Zero-pad to tile_size
-        c = tile.shape[2] if tile.ndim == 3 else 1
+        c      = tile.shape[2] if tile.ndim == 3 else 1
         padded = np.zeros((tile_size, tile_size, c), dtype=tile.dtype)
         padded[:h, :w] = tile
         return padded
@@ -204,11 +208,11 @@ def adjust_boxes_to_tile(
     )
 
     # Clip to tile
-    clipped         = boxes.copy().astype(np.float32)
-    clipped[:, 0]   = np.clip(boxes[:, 0] - x1, 0, tile_w)  # xmin
-    clipped[:, 1]   = np.clip(boxes[:, 1] - y1, 0, tile_h)  # ymin
-    clipped[:, 2]   = np.clip(boxes[:, 2] - x1, 0, tile_w)  # xmax
-    clipped[:, 3]   = np.clip(boxes[:, 3] - y1, 0, tile_h)  # ymax
+    clipped       = boxes.copy().astype(np.float32)
+    clipped[:, 0] = np.clip(boxes[:, 0] - x1, 0, tile_w)  # xmin
+    clipped[:, 1] = np.clip(boxes[:, 1] - y1, 0, tile_h)  # ymin
+    clipped[:, 2] = np.clip(boxes[:, 2] - x1, 0, tile_w)  # xmax
+    clipped[:, 3] = np.clip(boxes[:, 3] - y1, 0, tile_h)  # ymax
 
     # Clipped areas
     clip_areas = (
@@ -307,8 +311,6 @@ def image_to_tiles(
     """
     Split a full pre/post image pair into annotated tiles.
 
-    This is the core tiling function called by the dataset.
-
     Args:
         pre_image:      HxWx3 numpy array (pre-disaster)
         post_image:     HxWx3 numpy array (post-disaster)
@@ -330,9 +332,9 @@ def image_to_tiles(
             labels      : M int64 array
             tile_info   : TileInfo object
     """
-    h, w    = pre_image.shape[:2]
-    coords  = generate_tile_coords(w, h, tile_size, overlap)
-    tiles   = []
+    h, w   = pre_image.shape[:2]
+    coords = generate_tile_coords(w, h, tile_size, overlap)
+    tiles  = []
 
     for idx, (x1, y1, x2, y2) in enumerate(coords):
 
@@ -411,7 +413,7 @@ class TileCache:
     def _check_cache(self) -> None:
         """Check if cache exists and is valid."""
         if self._meta_path.exists():
-            with open(self._meta_path) as f:
+            with open(self._meta_path, encoding="utf-8") as f:
                 meta = json.load(f)
             if meta.get("config_hash") == self.config_hash:
                 self._is_ready = meta.get("complete", False)
@@ -446,9 +448,12 @@ class TileCache:
         tile["tile_info"] = TileInfo.from_dict(tile["tile_info"])
         return tile
 
-    def save_index(self, index: List[Tuple[str, int]]) -> None:
+    def save_index(
+        self,
+        index: List[Tuple[str, str, int]],  # [FIX BUG-7] was Tuple[str, int]
+    ) -> None:
         """
-        Save the tile index (list of (image_id, tile_idx) pairs).
+        Save the tile index (list of (folder, image_id, tile_idx) triples).
         Called once after all tiles are cached.
         """
         index_path = self.cache_dir / "_tile_index.pkl"
@@ -456,7 +461,7 @@ class TileCache:
             pickle.dump(index, f)
 
         # Mark cache as complete
-        with open(self._meta_path, "w") as f:
+        with open(self._meta_path, "w", encoding="utf-8") as f:
             json.dump({
                 "config_hash": self.config_hash,
                 "complete":    True,
@@ -465,7 +470,9 @@ class TileCache:
 
         self._is_ready = True
 
-    def load_index(self) -> List[Tuple[str, int]]:
+    def load_index(
+        self,
+    ) -> List[Tuple[str, str, int]]:   # [FIX BUG-7] was Tuple[str, int]
         """Load tile index from cache."""
         index_path = self.cache_dir / "_tile_index.pkl"
         if not index_path.exists():
@@ -607,9 +614,9 @@ if __name__ == "__main__":
     print("🧪 Testing tiling.py...")
 
     # Synthetic test: 1024×1024 image with 5 buildings
-    H, W       = 1024, 1024
-    TILE_SIZE  = 384
-    OVERLAP    = 0.15
+    H, W      = 1024, 1024
+    TILE_SIZE = 384
+    OVERLAP   = 0.15
 
     pre_img  = np.random.randint(0, 255, (H, W, 3), dtype=np.uint8)
     post_img = np.random.randint(0, 255, (H, W, 3), dtype=np.uint8)
@@ -624,7 +631,7 @@ if __name__ == "__main__":
     ], dtype=np.float32)
 
     masks  = np.zeros((5, H, W), dtype=np.uint8)
-    labels = np.array([0, 1, 2, 3, 0], dtype=np.int64)
+    labels = np.array([1, 2, 3, 4, 1], dtype=np.int64)
 
     for i, (x1, y1, x2, y2) in enumerate(boxes.astype(int)):
         masks[i, y1:y2, x1:x2] = 1
@@ -649,23 +656,33 @@ if __name__ == "__main__":
     print(f"  ✓ First tile masks:      {tiles[0]['masks'].shape}")
     print(f"  ✓ First tile info:       {tiles[0]['tile_info']}")
 
-    # Test cache
+    # Test cache — verify 3-tuple index round-trip  [FIX BUG-7]
     import tempfile
     with tempfile.TemporaryDirectory() as tmpdir:
         cache = TileCache(tmpdir, config_hash="abc12345")
         assert not cache.is_ready
 
-        index = []
+        index: List[Tuple[str, str, int]] = []
         for tile in tiles:
             cache.save_tile(tile)
             info = tile["tile_info"]
-            index.append((info.image_id, info.tile_idx))
+            # 3-tuple: (folder, image_id, tile_idx)
+            folder, image_id = "tier1", info.image_id
+            index.append((folder, image_id, info.tile_idx))
 
         cache.save_index(index)
         assert cache.is_ready
-        print(f"  ✓ Cache saved: {len(index)} tiles")
+        print(f"  ✓ Cache saved: {len(index)} tiles (3-tuple index)")
 
-        loaded = cache.load_tile("test_image_001", tiles[0]["tile_info"].tile_idx)
+        loaded_index = cache.load_index()
+        assert len(loaded_index[0]) == 3, \
+            "Index entries must be 3-tuples (folder, image_id, tile_idx)"
+        print(f"  ✓ Cache index round-trip: {loaded_index[0]}")
+
+        loaded = cache.load_tile(
+            tiles[0]["tile_info"].image_id,
+            tiles[0]["tile_info"].tile_idx,
+        )
         assert loaded is not None
         print(f"  ✓ Cache load successful")
 

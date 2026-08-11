@@ -45,3 +45,15 @@ data/xbd/
 data/pre/
 data/post/
 data/labels/
+
+# Local virtual environment
+Xray_venv/
+
+# Dataset archive and extracted dataset
+Zip XBD.zip
+Zip XBD/
+
+# Generated logs and evaluation results
+outputs/logs/
+outputs/map_results/
+

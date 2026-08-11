@@ -21,6 +21,22 @@ Key difference from assumption:
     Pre AND post images are in the SAME images/ folder
     Named: {disaster}_{id}_pre_disaster.png
             {disaster}_{id}_post_disaster.png
+
+Fixes applied:
+    [BUG-9a] NUM_CLASSES unified to 5 (matches model.py: 0=background +
+             4 damage classes).  Original had NUM_CLASSES=4 which caused
+             compute_class_distribution to count only classes 1-4 via
+             range(1, 5) — that part was coincidentally correct, but the
+             constant itself was misleading and misaligned with model.py.
+
+    [BUG-9b] CLASS_NAMES extended with background class 0 so the dict
+             covers all valid label indices (0-4) rather than just 0-3.
+
+    [BUG-9c] compute_class_distribution replaced with a fast implementation
+             that reads labels from cache pickles (already on disk from
+             _build_index) instead of iterating every tile through
+             __getitem__ which re-loaded images and annotations from disk
+             for every single tile — O(N × disk_IO) vs O(N × pickle).
 """
 
 import os
@@ -54,14 +70,20 @@ DAMAGE_LABEL_MAP = {
     "un-classified": 0,
 }
 
+# [FIX BUG-9b] Include background (0) so dict covers all label indices
 CLASS_NAMES = {
-    0: "no-damage",
-    1: "minor-damage",
-    2: "major-damage",
-    3: "destroyed",
+    0: "background",
+    1: "no-damage",
+    2: "minor-damage",
+    3: "major-damage",
+    4: "destroyed",
 }
 
-NUM_CLASSES = 4
+# [FIX BUG-9a] Matches model.py NUM_CLASSES=5 (background + 4 damage)
+NUM_CLASSES = 5  # 0=background, 1=no-damage, 2=minor, 3=major, 4=destroyed
+
+# Human-readable class labels for metrics (damage classes only, 1-indexed)
+DAMAGE_CLASS_NAMES = ["no-damage", "minor-damage", "major-damage", "destroyed"]
 
 # xBD split → folder mapping
 SPLIT_FOLDERS = {
@@ -94,8 +116,10 @@ def parse_xbd_annotation(
 
     Returns:
         Dict with boxes, masks, labels, uids
+        Labels are 1-indexed (1=no-damage ... 4=destroyed).
+        0 is reserved for background by Mask R-CNN convention.
     """
-    with open(label_path, "r") as f:
+    with open(label_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
     features = data.get("features", {}).get("xy", [])
@@ -267,9 +291,9 @@ class XBDPathResolver:
         Returns:
             (pre_path, post_path, label_path)
         """
-        base     = self.data_dir / folder
-        pre_path = base / "images" / f"{image_id}_pre_disaster.png"
-        post_path = base / "images" / f"{image_id}_post_disaster.png"
+        base       = self.data_dir / folder
+        pre_path   = base / "images" / f"{image_id}_pre_disaster.png"
+        post_path  = base / "images" / f"{image_id}_post_disaster.png"
         label_path = base / "labels" / f"{image_id}_post_disaster.json"
 
         return pre_path, post_path, label_path
@@ -584,8 +608,33 @@ def build_dataloader(cfg, split: str = "train", epoch: int = 0) -> DataLoader:
 
 
 def compute_class_distribution(dataset: XBDDataset) -> Dict[int, int]:
-    """Count instances per damage class across all tiles."""
-    counts = {i: 0 for i in range(1, NUM_CLASSES + 1)}
+    """
+    Count instances per damage class across all tiles.
+
+    [FIX BUG-9c] Original implementation iterated every tile via
+    __getitem__ which reloaded images + annotations from disk for
+    each tile — O(N × disk_IO).  This version reads labels directly
+    from the cache pickle files (already generated during _build_index),
+    falling back to the slow path only if the cache is unavailable.
+
+    Returns:
+        Dict mapping class_id (1-4) → instance count
+    """
+    # Damage class ids are 1-4 (0 = background, excluded from counts)
+    counts: Dict[int, int] = {i: 0 for i in range(1, NUM_CLASSES)}
+
+    # Fast path: read from cache pickles — no image I/O
+    if dataset.use_cache and dataset.cache.is_ready:
+        for folder, image_id, tile_idx in dataset.tile_index:
+            cache_id = f"{folder}/{image_id}"
+            tile = dataset.cache.load_tile(cache_id, tile_idx)
+            if tile is not None:
+                for label in tile["labels"].tolist():
+                    if label in counts:
+                        counts[label] += 1
+        return counts
+
+    # Slow fallback: iterate dataset via __getitem__
     for idx in range(len(dataset)):
         _, _, target, _ = dataset[idx]
         for label in target["labels"].tolist():
@@ -632,10 +681,17 @@ if __name__ == "__main__":
 
     ann = parse_xbd_annotation(ann_path, 1024, 1024)
     assert len(ann["boxes"])  == 2
-    assert ann["labels"][0]   == 1  # no-damage → 1
-    assert ann["labels"][1]   == 4  # destroyed → 4
+    assert ann["labels"][0]   == 1  # no-damage  → 1
+    assert ann["labels"][1]   == 4  # destroyed  → 4
     print(f"  ✓ Annotation parser: {len(ann['boxes'])} buildings")
     print(f"  ✓ Labels: {ann['labels']} (1=no-damage, 4=destroyed)")
+
+    # Test NUM_CLASSES consistency
+    assert NUM_CLASSES == 5, "NUM_CLASSES must be 5 to match model.py"
+    assert len(CLASS_NAMES) == 5, "CLASS_NAMES must cover 0-4"
+    assert CLASS_NAMES[0] == "background"
+    assert CLASS_NAMES[4] == "destroyed"
+    print(f"  ✓ NUM_CLASSES={NUM_CLASSES}, CLASS_NAMES covers 0-4")
 
     # Test tensor conversion
     img = np.random.randint(0, 255, (384, 384, 3), dtype=np.uint8)

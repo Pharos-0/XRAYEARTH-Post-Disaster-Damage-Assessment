@@ -1,12 +1,17 @@
 # ═══════════════════════════════════════════════════════════
 #  XRayEarth — requirements.txt
-#  Python 3.10 | CUDA 11.8
+#  Python 3.11 | CUDA 12.8 | RTX 5060 (Blackwell sm_120)
+#
+#  IMPORTANT: Install PyTorch FIRST before this file:
+#    pip install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu128
+#
+#  Then install the rest:
+#    pip install -r requirements.txt
 # ═══════════════════════════════════════════════════════════
 
-# ── Core PyTorch (install via conda or pip with CUDA index) ─
-# pip install torch==2.1.2 torchvision==0.16.2 --index-url https://download.pytorch.org/whl/cu118
-torch==2.1.2
-torchvision==0.16.2
+# ── Core PyTorch (install separately — see note above) ────
+# torch (nightly cu128) — installed manually before this file
+# torchvision (nightly cu128) — installed manually before this file
 
 # ── Computer Vision ───────────────────────────────────────
 opencv-python==4.9.0.80
@@ -27,11 +32,11 @@ PyYAML==6.0.1
 omegaconf==2.3.0
 
 # ── Experiment Tracking ───────────────────────────────────
-wandb==0.16.6
+wandb
 
 # ── Metrics ───────────────────────────────────────────────
 scikit-learn==1.3.2
-torchmetrics==1.3.1
+torchmetrics
 
 # ── ONNX Export ───────────────────────────────────────────
 onnx==1.15.0
@@ -43,8 +48,6 @@ seaborn==0.13.2
 rich==13.7.1
 python-dotenv==1.0.1
 
-# ── TensorRT (Machine B only — install manually) ──────────
-# nvidia-pyindex
-# tensorrt==8.6.1
-# pycuda==2023.1
-# NOTE: Uncomment on Machine B after installing CUDA 11.8 + cuDNN 8.6
+# ── TensorRT (optional — after training completes) ────────
+# pip install tensorrt pycuda
+# NOTE: Install manually after full training if TRT export needed

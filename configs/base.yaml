@@ -5,6 +5,9 @@
 #    {data_dir}/tier3/images/, tier3/labels/
 #    {data_dir}/hold/images/,  hold/labels/
 #    {data_dir}/test/images/,  test/labels/
+#
+#  Fix [BUG-5]: Added freeze_backbone and classifier_head
+#  so every version config can rely on them being present.
 # ═══════════════════════════════════════════════════════════
 
 project:
@@ -31,13 +34,15 @@ dataset:
   use_cache:          true
 
 model:
-  backbone:    resnet50
-  pretrained:  false
-  num_classes: 4
-  siamese:     false
-  fusion:      concat_diff
-  dropout:     0.0
-  norm_layer:  batch_norm
+  backbone:         resnet50
+  pretrained:       false
+  num_classes:      4
+  siamese:          false
+  fusion:           concat_diff
+  dropout:          0.0
+  norm_layer:       batch_norm
+  classifier_head:  default   # [FIX BUG-5] was missing
+  freeze_backbone:  false     # [FIX BUG-5] was missing
 
 loss:
   type:         cross_entropy

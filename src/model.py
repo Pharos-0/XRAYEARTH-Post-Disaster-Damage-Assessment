@@ -10,6 +10,21 @@ Responsibilities:
     - Configurable: ResNet34 or ResNet50 backbone
     - Support for GroupNorm (better with small batch sizes)
     - Clean forward pass returning standard Mask R-CNN loss dict
+
+Fixes applied:
+    [BUG-1] Siamese forward now actually feeds fused features into the
+            detector via a FusedFeatureBackbone wrapper that overrides
+            the backbone callable used by MaskRCNN internally.
+            Previously _extract_features() computed fused features but
+            forward() ignored them and called detector(post_images)
+            directly, making all Siamese fusion dead code.
+
+    [BUG-2] Backbone no longer runs 3× per step.
+            Old flow: _extract_features (2× backbone) + detector
+            internally runs backbone again = 3 forward passes.
+            Fix: FusedFeatureBackbone caches the fused feature dict
+            computed in _extract_features and returns it when the
+            detector calls self.backbone internally — 0 extra passes.
 """
 
 import os
@@ -217,6 +232,68 @@ class SiameseBackbone(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════
+#  3b. FUSED-FEATURE BACKBONE WRAPPER  [FIX BUG-1 + BUG-2]
+# ═══════════════════════════════════════════════════════════
+
+class FusedFeatureBackbone(nn.Module):
+    """
+    Thin wrapper that makes pre-computed fused features available
+    to MaskRCNN's internal backbone call.
+
+    Problem:
+        MaskRCNN internally calls self.backbone(images) during its
+        forward pass to extract features for RPN and ROI heads.
+        We cannot easily intercept this from outside.
+
+    Solution:
+        Replace detector.backbone with this wrapper.
+        Before calling detector.forward(), we call
+        set_fused_features(features) to cache the already-computed
+        fused feature dict.  When MaskRCNN internally calls
+        self.backbone(images), it hits our __call__ which returns
+        the cached dict instead of running the backbone again.
+
+        In single-image mode the cache is not set, so the call
+        falls through to the real backbone — identical behaviour.
+
+    This gives us:
+        - Exactly 0 extra backbone forward passes (BUG-2 fixed)
+        - Fused features actually reach RPN + ROI heads (BUG-1 fixed)
+
+    Attributes:
+        out_channels: Exposed so MaskRCNN can read channel count.
+    """
+
+    def __init__(self, real_backbone: nn.Module):
+        super().__init__()
+        self.real_backbone = real_backbone
+        self.out_channels  = real_backbone.out_channels
+        self._fused_cache: Optional[Dict[str, torch.Tensor]] = None
+
+    def set_fused_features(
+        self,
+        features: Dict[str, torch.Tensor],
+    ) -> None:
+        """Cache fused features before calling detector.forward()."""
+        self._fused_cache = features
+
+    def clear_fused_features(self) -> None:
+        """Clear cache after detector.forward() completes."""
+        self._fused_cache = None
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Return cached fused features if available, else run backbone.
+
+        In Siamese mode: returns the pre-computed fused dict directly.
+        In single-image mode: runs the real backbone normally.
+        """
+        if self._fused_cache is not None:
+            return self._fused_cache
+        return self.real_backbone(x)
+
+
+# ═══════════════════════════════════════════════════════════
 #  4. CLASSIFIER HEAD
 # ═══════════════════════════════════════════════════════════
 
@@ -268,12 +345,13 @@ class XRayEarthModel(nn.Module):
 
     Mode A — Single Image (V1–V9 baseline):
         Only post image used.
-        Standard Mask R-CNN forward pass.
+        Standard Mask R-CNN forward pass through real backbone.
 
     Mode B — Siamese (V10 full system):
         Both pre + post images processed by shared backbone.
         Features fused via Concat + Diff at FPN level.
-        Fused features passed to RPN + ROI heads.
+        Fused features injected into detector via
+        FusedFeatureBackbone wrapper before RPN + ROI heads run.
 
     Args:
         cfg: Full OmegaConf experiment config
@@ -309,11 +387,20 @@ class XRayEarthModel(nn.Module):
                 norm_type    = norm_type,
             )
 
+        # ── Fused-Feature Backbone Wrapper ────────────────
+        # [FIX BUG-1 + BUG-2]
+        # This wrapper is always installed as detector.backbone.
+        # In Siamese mode, we load it with fused features before
+        # each forward call so MaskRCNN uses them internally.
+        # In single-image mode the cache is never set so it falls
+        # through to the real backbone — no overhead.
+        self._fused_backbone = FusedFeatureBackbone(
+            self.backbone.fpn_backbone
+        )
+
         # ── Mask R-CNN Detection Head ─────────────────────
-        # Build Mask R-CNN using the backbone
-        # We use torchvision's MaskRCNN with our custom backbone
         self.detector = self._build_detector(
-            backbone         = self.backbone.fpn_backbone,
+            backbone         = self._fused_backbone,
             num_classes      = NUM_CLASSES,
             classifier_head  = classifier_head,
             dropout          = dropout,
@@ -330,7 +417,7 @@ class XRayEarthModel(nn.Module):
         Build Mask R-CNN detector with custom head.
 
         Args:
-            backbone:        FPN backbone (already built)
+            backbone:        FusedFeatureBackbone wrapper
             num_classes:     Number of output classes
             classifier_head: "default" | "deep"
             dropout:         Dropout probability
@@ -353,11 +440,6 @@ class XRayEarthModel(nn.Module):
 
         if classifier_head == "deep":
             # V3+: 2-layer MLP head
-            model.roi_heads.box_predictor = nn.ModuleDict({
-                "cls_score": DeepClassifierHead(in_features, num_classes, dropout),
-                "bbox_pred": nn.Linear(in_features, num_classes * 4),
-            })
-            # Patch: replace with proper FastRCNNPredictor wrapper
             model.roi_heads.box_predictor = _DeepFastRCNNPredictor(
                 in_features, num_classes, dropout
             )
@@ -380,41 +462,35 @@ class XRayEarthModel(nn.Module):
 
         return model
 
-    def _extract_features(
+    def _compute_fused_features(
         self,
         pre_images:  List[torch.Tensor],
         post_images: List[torch.Tensor],
-    ) -> Dict[str, torch.Tensor]:
+    ) -> Optional[Dict[str, torch.Tensor]]:
         """
-        Extract and fuse features from pre/post image pairs.
+        Compute fused FPN features from pre/post image pairs.
 
-        Single-image mode: only uses post images
-        Siamese mode:      fuses pre + post FPN features
+        Single-image mode: returns None (no caching needed)
+        Siamese mode:      returns fused feature dict
 
         Args:
             pre_images:  List of [3, H, W] tensors
             post_images: List of [3, H, W] tensors
 
         Returns:
-            Feature dict for RPN/ROI heads
+            Fused feature dict or None
         """
-        # Stack into batch
-        post_batch = torch.stack(post_images, dim=0)
-
         if not self.siamese:
-            # V1–V9: single image mode, use post only
-            return self.backbone(post_batch)
+            return None  # detector uses real backbone directly
 
-        # V10: Siamese mode
-        pre_batch = torch.stack(pre_images, dim=0)
+        # V10: Siamese mode — run backbone exactly once per image set
+        pre_batch  = torch.stack(pre_images,  dim=0)
+        post_batch = torch.stack(post_images, dim=0)
 
         pre_features  = self.backbone(pre_batch)
         post_features = self.backbone(post_batch)
 
-        # Fuse: concat + difference at each FPN level
-        fused_features = self.fusion(pre_features, post_features)
-
-        return fused_features
+        return self.fusion(pre_features, post_features)
 
     def forward(
         self,
@@ -443,18 +519,28 @@ class XRayEarthModel(nn.Module):
             Training: Dict[str, Tensor] loss dict
             Inference: List[Dict[str, Tensor]] predictions
         """
-        # Extract fused features
-        features = self._extract_features(pre_images, post_images)
+        # ── [FIX BUG-1 + BUG-2] ──────────────────────────
+        # Compute fused features ONCE, then inject into the backbone
+        # wrapper so MaskRCNN picks them up internally without running
+        # the backbone again.
+        fused = self._compute_fused_features(pre_images, post_images)
+        if fused is not None:
+            self._fused_backbone.set_fused_features(fused)
 
-        # Mask R-CNN forward
-        # We need to pass images for image size info used by RPN
-        # Use post images as the "images" for size reference
-        if self.training and targets is not None:
-            losses = self.detector(post_images, targets)
-            return losses
-        else:
-            predictions = self.detector(post_images)
-            return predictions
+        try:
+            # Mask R-CNN forward — post images used for image sizes
+            # (transforms, RPN anchor generation).
+            # detector.backbone is our FusedFeatureBackbone: if fused
+            # is cached it returns it; otherwise runs the real backbone.
+            if self.training and targets is not None:
+                result = self.detector(post_images, targets)
+            else:
+                result = self.detector(post_images)
+        finally:
+            # Always clear cache so stale features are never reused
+            self._fused_backbone.clear_fused_features()
+
+        return result
 
 
 class _DeepFastRCNNPredictor(nn.Module):
@@ -491,7 +577,7 @@ def build_model(cfg) -> XRayEarthModel:
     model = XRayEarthModel(cfg)
 
     # Log model summary
-    total_params    = sum(p.numel() for p in model.parameters())
+    total_params     = sum(p.numel() for p in model.parameters())
     trainable_params = sum(
         p.numel() for p in model.parameters() if p.requires_grad
     )
@@ -562,7 +648,7 @@ if __name__ == "__main__":
 
     # ── Test V1: single image, no pretrain ────────────────
     print("\n  Testing V1 (single image baseline)...")
-    cfg_v1 = load_config(str(root / "configs" / "v1.yaml"))
+    cfg_v1   = load_config(str(root / "configs" / "v1.yaml"))
     model_v1 = build_model(cfg_v1)
     model_v1.eval()
 
@@ -585,7 +671,7 @@ if __name__ == "__main__":
 
     targets = []
     for _ in range(B):
-        n = 3  # 3 buildings per tile
+        n = 3
         targets.append({
             "boxes":  torch.tensor([
                 [10., 10., 80., 80.],
@@ -604,10 +690,20 @@ if __name__ == "__main__":
 
     # ── Test V10: Siamese mode ─────────────────────────────
     print("\n  Testing V10 (Siamese + Focal Loss)...")
-    cfg_v10  = load_config(str(root / "configs" / "v10.yaml"))
+    cfg_v10   = load_config(str(root / "configs" / "v10.yaml"))
     model_v10 = build_model(cfg_v10)
 
-    total    = sum(p.numel() for p in model_v10.parameters())
+    # Verify fused backbone cache is used and cleared properly
+    assert model_v10._fused_backbone._fused_cache is None, \
+        "Cache should be empty before forward"
+    model_v10.eval()
+    with torch.no_grad():
+        preds_v10 = model_v10(pre, post)
+    assert model_v10._fused_backbone._fused_cache is None, \
+        "Cache should be cleared after forward"
+    print(f"  ✓ V10 Siamese forward: cache cleared correctly")
+
+    total     = sum(p.numel() for p in model_v10.parameters())
     trainable = sum(
         p.numel() for p in model_v10.parameters() if p.requires_grad
     )

@@ -5,15 +5,32 @@ project:
   version: v10
   description: "FULL SYSTEM — Siamese + Focal Loss + 512x512 tiles"
 
+# [FIX BUG-6] Explicitly redeclare all keys that v10 depends on
+# from the chain (v7: dropout, v8: norm_layer, v3: classifier_head,
+# v6: freeze_backbone=false).  With the config-chain fix in utils.py
+# these are inherited automatically, but we keep them explicit here
+# as living documentation of what the full system uses.
 model:
-  backbone: resnet50       # back to resnet50 for full system
-  siamese: true
-  fusion: concat_diff
+  backbone:         resnet50      # back to resnet50 from v9's resnet34
+  pretrained:       true
+  siamese:          true
+  fusion:           concat_diff
+  classifier_head:  deep          # from v3
+  freeze_backbone:  false         # from v6
+  dropout:          0.3           # from v7
+  norm_layer:       group_norm    # from v8
 
 loss:
-  type: focal
-  focal_gamma: 2.0
-  focal_alpha: 0.25
+  type:         focal
+  focal_gamma:  2.0
+  focal_alpha:  0.25
 
 dataset:
   tile_size: 512
+
+training:
+  learning_rate: 0.00005    # from v6
+  weight_decay:  0.0005     # from v6
+
+augmentation:
+  enabled: true

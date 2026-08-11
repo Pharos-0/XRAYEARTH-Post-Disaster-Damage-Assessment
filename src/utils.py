@@ -10,6 +10,22 @@ Responsibilities:
     - Checkpoint save/load
     - WandB initialization
     - General helpers
+
+Fix applied:
+    [BUG-4] load_config() now walks the full defaults inheritance chain.
+            Previously it always merged base.yaml + version.yaml only.
+            Because the version YAMLs use Hydra-style "defaults: [vN]"
+            syntax (not native OmegaConf), the chain was ignored and
+            every version was merged directly against base.  This meant
+            keys declared in intermediate versions (e.g. dropout in v7,
+            norm_layer in v8) were silently missing from v9/v10.
+
+            Fix: _resolve_config_chain() reads the "defaults" key from
+            each YAML, resolves the parent config name, recursively
+            loads the full chain, then merges in order:
+                base → parent_N → ... → parent_1 → version
+            The "defaults" key is stripped before merging so OmegaConf
+            never sees it.
 """
 
 import os
@@ -19,7 +35,7 @@ import hashlib
 import json
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 import numpy as np
 import torch
@@ -53,26 +69,96 @@ def load_env() -> None:
         console.log("[yellow]⚠[/yellow] No .env file found — using defaults")
 
 
+def _resolve_config_chain(
+    version_path: Path,
+    configs_dir:  Path,
+) -> List[DictConfig]:
+    """
+    Walk the defaults chain declared in each YAML and return an
+    ordered list of DictConfig objects from outermost ancestor to
+    the version itself (base is NOT included — handled separately).
+
+    E.g. v10.yaml → defaults: [v9] → v9.yaml → defaults: [v8] → ...
+    Returns [v2_cfg, v3_cfg, ..., v9_cfg, v10_cfg]
+
+    The "defaults" key is stripped from each config so OmegaConf
+    never tries to resolve it as a field.
+
+    Args:
+        version_path: Absolute path to the version yaml
+        configs_dir:  Directory containing all version yamls
+
+    Returns:
+        Ordered list of stripped DictConfigs (ancestor → child)
+    """
+    chain     = []
+    seen      = set()
+    curr_path = version_path
+
+    while True:
+        if curr_path in seen:
+            break  # guard against circular references
+        seen.add(curr_path)
+
+        with open(curr_path, encoding="utf-8") as f:
+            raw = yaml.safe_load(f) or {}
+
+        # Extract and strip the "defaults" key
+        defaults = raw.pop("defaults", [])
+
+        # Load as OmegaConf (without defaults key)
+        cfg = OmegaConf.create(raw)
+        chain.append(cfg)
+
+        # Find parent config name
+        parent_name = None
+        for entry in defaults:
+            if isinstance(entry, str) and entry != "base":
+                parent_name = entry
+                break
+
+        if parent_name is None:
+            break  # reached a config that only inherits from base
+
+        parent_path = configs_dir / f"{parent_name}.yaml"
+        if not parent_path.exists():
+            console.log(
+                f"[yellow]⚠[/yellow] Parent config not found: {parent_path}"
+            )
+            break
+
+        curr_path = parent_path
+
+    # Reverse so we merge ancestor-first (later entries win)
+    chain.reverse()
+    return chain
+
+
 def load_config(config_path: str) -> DictConfig:
     """
     Load a version config (e.g. configs/v1.yaml).
 
     Strategy:
-        1. Load base.yaml as defaults
-        2. Load version yaml
-        3. Merge (version overrides base)
+        1. Load base.yaml as the root defaults
+        2. Walk the full defaults chain declared in the version yaml
+           (e.g. v10 → v9 → v8 → ... → v2 → base)
+        3. Merge in order: base → chain[0] → ... → chain[-1]
+           (later configs override earlier ones)
         4. Resolve environment variables via OmegaConf
+
+    [FIX BUG-4] Full defaults chain is now respected, not ignored.
 
     Args:
         config_path: Path to version config (e.g. "configs/v1.yaml")
 
     Returns:
-        Merged OmegaConf DictConfig
+        Merged OmegaConf DictConfig with full inheritance applied
     """
     load_env()
 
     project_root = Path(__file__).resolve().parents[1]
-    base_path    = project_root / "configs" / "base.yaml"
+    configs_dir  = project_root / "configs"
+    base_path    = configs_dir / "base.yaml"
     version_path = Path(config_path)
 
     if not version_path.is_absolute():
@@ -84,17 +170,28 @@ def load_config(config_path: str) -> DictConfig:
     if not version_path.exists():
         raise FileNotFoundError(f"Config not found at {version_path}")
 
-    # Load both configs
-    base_cfg    = OmegaConf.load(base_path)
-    version_cfg = OmegaConf.load(version_path)
+    # Load base config (strip "defaults" key if present)
+    with open(base_path, encoding="utf-8") as f:
+        base_raw = yaml.safe_load(f) or {}
+    base_raw.pop("defaults", None)
+    base_cfg = OmegaConf.create(base_raw)
 
-    # Merge: version values override base
-    cfg = OmegaConf.merge(base_cfg, version_cfg)
+    # Resolve the full inheritance chain for the version config
+    # Returns [ancestor_cfg, ..., version_cfg] with defaults stripped
+    chain = _resolve_config_chain(version_path, configs_dir)
+
+    # Merge: base first, then each link in the chain
+    cfg = base_cfg
+    for link_cfg in chain:
+        cfg = OmegaConf.merge(cfg, link_cfg)
 
     # Resolve env vars (e.g. ${oc.env:DATA_DIR,./data})
     OmegaConf.resolve(cfg)
 
-    console.log(f"[green]✓[/green] Config loaded: [bold]{version_path.name}[/bold]")
+    console.log(
+        f"[green]✓[/green] Config loaded: [bold]{version_path.name}[/bold] "
+        f"(chain depth: {len(chain)})"
+    )
     return cfg
 
 
@@ -157,9 +254,9 @@ def get_device() -> torch.device:
         torch.device: cuda or cpu
     """
     if torch.cuda.is_available():
-        device    = torch.device("cuda")
-        gpu_name  = torch.cuda.get_device_name(0)
-        gpu_mem   = torch.cuda.get_device_properties(0).total_memory / 1e9
+        device   = torch.device("cuda")
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_mem  = torch.cuda.get_device_properties(0).total_memory / 1e9
         console.log(
             f"[green]✓[/green] GPU detected: [bold]{gpu_name}[/bold] "
             f"({gpu_mem:.1f} GB)"
@@ -196,7 +293,7 @@ def setup_logging(log_dir: str, version: str) -> logging.Logger:
     Returns:
         Configured logger
     """
-    log_dir  = Path(log_dir)
+    log_dir   = Path(log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -254,12 +351,12 @@ def save_checkpoint(
     version = cfg.project.version
 
     state = {
-        "epoch":      epoch,
-        "version":    version,
-        "metrics":    metrics,
-        "model":      model.state_dict(),
-        "optimizer":  optimizer.state_dict(),
-        "config":     OmegaConf.to_container(cfg, resolve=True),
+        "epoch":     epoch,
+        "version":   version,
+        "metrics":   metrics,
+        "model":     model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "config":    OmegaConf.to_container(cfg, resolve=True),
     }
 
     # Always save latest
@@ -300,14 +397,16 @@ def load_checkpoint(
     if device is None:
         device = get_device()
 
-    path  = Path(checkpoint_path)
+    path = Path(checkpoint_path)
     if not path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {path}")
 
     state = torch.load(path, map_location=device)
 
     model.load_state_dict(state["model"])
-    console.log(f"[green]✓[/green] Model weights loaded from [bold]{path.name}[/bold]")
+    console.log(
+        f"[green]✓[/green] Model weights loaded from [bold]{path.name}[/bold]"
+    )
 
     if optimizer is not None and "optimizer" in state:
         optimizer.load_state_dict(state["optimizer"])
@@ -358,11 +457,13 @@ def init_wandb(cfg: DictConfig, smoke_test: bool = False) -> None:
 
 def print_config(cfg: DictConfig) -> None:
     """Pretty-print the active config as a rich table."""
-    table = Table(title=f"XRayEarth Config — {cfg.project.version}", 
-                  show_header=True)
-    table.add_column("Section",   style="cyan",  no_wrap=True)
-    table.add_column("Key",       style="white")
-    table.add_column("Value",     style="green")
+    table = Table(
+        title       = f"XRayEarth Config — {cfg.project.version}",
+        show_header = True,
+    )
+    table.add_column("Section", style="cyan",  no_wrap=True)
+    table.add_column("Key",     style="white")
+    table.add_column("Value",   style="green")
 
     cfg_dict = OmegaConf.to_container(cfg, resolve=True)
     for section, values in cfg_dict.items():
@@ -424,24 +525,52 @@ def get_project_root() -> Path:
 if __name__ == "__main__":
     print_banner()
 
-    # Test config loading
-    root   = get_project_root()
-    cfg    = load_config(str(root / "configs" / "v1.yaml"))
+    root = get_project_root()
 
-    # Test seed
-    set_seed(cfg.project.seed)
+    # ── Test config loading with chain inheritance ─────────
+    print("\n  Testing config chain inheritance...")
+    cfg_v1  = load_config(str(root / "configs" / "v1.yaml"))
+    cfg_v10 = load_config(str(root / "configs" / "v10.yaml"))
 
-    # Test device
+    # V1 should have baseline values
+    assert cfg_v1.model.pretrained  == False
+    assert cfg_v1.model.siamese     == False
+    assert cfg_v1.loss.type         == "cross_entropy"
+    print(f"  ✓ V1: pretrained={cfg_v1.model.pretrained}, "
+          f"siamese={cfg_v1.model.siamese}, loss={cfg_v1.loss.type}")
+
+    # V10 should have full chain applied
+    assert cfg_v10.model.siamese         == True,   "V10 must have siamese=true"
+    assert cfg_v10.model.backbone        == "resnet50"
+    assert cfg_v10.loss.type             == "focal", "V10 must use focal loss"
+    assert cfg_v10.model.classifier_head == "deep",  \
+        "V10 must inherit classifier_head=deep from v3"
+    assert cfg_v10.model.dropout         == 0.3,     \
+        "V10 must inherit dropout=0.3 from v7"
+    assert cfg_v10.model.norm_layer      == "group_norm", \
+        "V10 must inherit group_norm from v8"
+    assert cfg_v10.dataset.tile_size     == 512,     \
+        "V10 must have tile_size=512"
+    print(f"  ✓ V10: siamese={cfg_v10.model.siamese}, "
+          f"loss={cfg_v10.loss.type}, "
+          f"dropout={cfg_v10.model.dropout}, "
+          f"norm={cfg_v10.model.norm_layer}, "
+          f"tile={cfg_v10.dataset.tile_size}")
+
+    # ── Test seed ──────────────────────────────────────────
+    set_seed(cfg_v1.project.seed)
+
+    # ── Test device ────────────────────────────────────────
     device = get_device()
 
-    # Test config display
-    print_config(cfg)
+    # ── Test config display ────────────────────────────────
+    print_config(cfg_v10)
 
-    # Test config hash
-    h = get_config_hash(cfg)
+    # ── Test config hash ───────────────────────────────────
+    h = get_config_hash(cfg_v10)
     console.log(f"[green]✓[/green] Config hash: [bold]{h}[/bold]")
 
-    # Test dir creation
-    ensure_dirs(cfg)
+    # ── Test dir creation ──────────────────────────────────
+    ensure_dirs(cfg_v1)
 
     console.log("[bold green]✅ utils.py self-test passed![/bold green]")
